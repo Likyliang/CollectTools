@@ -38,36 +38,30 @@ def _pick_time_in_seconds(df: pd.DataFrame) -> np.ndarray:
         if col in ldf:
             t_ns = _to_float(ldf[col]); t_ns = t_ns[np.isfinite(t_ns)]
             if t_ns.size >= 2:
-                t = (t_ns - t_ns[0]) / 1e9
-                return t
+                return (t_ns - t_ns[0]) / 1e9
 
     # 2) gyro 硬件时间戳（少见但给兜底）
     for col in ["gyro_event_timestamp_ns"]:
         if col in ldf:
             t_ns = _to_float(ldf[col]); t_ns = t_ns[np.isfinite(t_ns)]
             if t_ns.size >= 2:
-                t = (t_ns - t_ns[0]) / 1e9
-                return t
+                return (t_ns - t_ns[0]) / 1e9
 
-    # 3) 纠正后的墙钟（毫秒）——注意可能有重复/台阶，做去重扰动
+    # 3) 纠正后的墙钟（毫秒）——相同毫秒加极小扰动避免 dt=0
     for col in ["corrected_wall_clock_ms", "corrected_wall_clock"]:
         if col in ldf:
             t_ms = _to_float(ldf[col]); t_ms = t_ms[np.isfinite(t_ms)]
             if t_ms.size >= 2:
-                # 去重/台阶小抖动：对相同毫秒内的样本加极小递增抖动，避免 dt=0
-                # 抖动幅度 << 1ms，不影响统计（这里用 1e-6 ms = 1e-9 s）
                 if np.any(np.diff(t_ms) == 0):
-                    # 计算每个相同值的序号
                     _, inv, counts = np.unique(t_ms, return_inverse=True, return_counts=True)
                     offsets = np.zeros_like(t_ms, dtype="float64")
                     idx = np.argsort(inv, kind="stable")
-                    # 为每个重复组生成 0,1,2,... 的序号
                     start = 0
                     for c in counts:
                         if c > 1:
                             offsets[idx[start:start+c]] = np.arange(c, dtype="float64")
                         start += c
-                    t_ms = t_ms + offsets * 1e-6  # 每个重复样本+1e-6ms
+                    t_ms = t_ms + offsets * 1e-6  # 1e-6 ms 抖动
                 return (t_ms - t_ms[0]) / 1e3
 
     # 4) 原始墙钟（毫秒）
@@ -90,9 +84,46 @@ def _pick_time_in_seconds(df: pd.DataFrame) -> np.ndarray:
     # 5) 实在没有：用行号伪时间（仅为避免崩溃）
     return np.arange(len(ldf), dtype="float64")
 
+def _mode_stats(df: pd.DataFrame) -> dict:
+    """统计 gyro_mode 的数量与占比；并对 EXACT 行的 delta_ns 做统计（ms）"""
+    ldf = _lower_cols(df)
+    out = {}
+
+    if "gyro_mode" in ldf.columns:
+        modes = ldf["gyro_mode"].astype(str).str.strip().str.upper()
+        n = len(modes)
+        n_exact  = int((modes == "EXACT").sum())
+        n_interp = int((modes == "INTERP").sum())
+        n_none   = int((modes == "NONE").sum())
+
+        out["mode_exact_cnt"]  = n_exact
+        out["mode_interp_cnt"] = n_interp
+        out["mode_none_cnt"]   = n_none
+        out["mode_exact_ratio"]  = round(n_exact  / n, 6) if n else np.nan
+        out["mode_interp_ratio"] = round(n_interp / n, 6) if n else np.nan
+        out["mode_none_ratio"]   = round(n_none   / n, 6) if n else np.nan
+
+        # EXACT 的 delta_ns 统计（ms）
+        if "delta_ns" in ldf.columns:
+            delta = pd.to_numeric(ldf.loc[modes == "EXACT", "delta_ns"], errors="coerce")
+            delta = delta[np.isfinite(delta)]
+            if delta.size >= 1:
+                d_ms = delta.to_numpy(dtype="float64") / 1e6
+                out["exact_delta_ms_mean"] = round(float(np.mean(d_ms)), 6)
+                out["exact_delta_ms_p95"]  = round(float(np.percentile(d_ms, 95)), 6)
+            else:
+                out["exact_delta_ms_mean"] = np.nan
+                out["exact_delta_ms_p95"]  = np.nan
+    else:
+        # 没有 gyro_mode 列时给出空占位，避免下游出错
+        out["mode_exact_cnt"] = out["mode_interp_cnt"] = out["mode_none_cnt"] = np.nan
+        out["mode_exact_ratio"] = out["mode_interp_ratio"] = out["mode_none_ratio"] = np.nan
+        out["exact_delta_ms_mean"] = out["exact_delta_ms_p95"] = np.nan
+
+    return out
+
 def analyze_csv(path: Path) -> dict:
     try:
-        # 保持默认 parser；后续对列手动 numeric 转换
         df = pd.read_csv(path)
     except Exception as e:
         return {"file": str(path), "error": f"read_csv failed: {e}"}
@@ -139,6 +170,7 @@ def analyze_csv(path: Path) -> dict:
         "dt_max_s":  round(float(np.max(dt)), 6),
     }
     out.update(nan_ratios)
+    out.update(_mode_stats(df))       # ✅ 新增：gyro_mode 与 delta 质量指标
     return out
 
 def walk_all(root: str) -> pd.DataFrame:
