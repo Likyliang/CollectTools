@@ -1,7 +1,7 @@
 # export_all.py
 # 用法：
-#   python export_all.py            # 导出今天
-#   python export_all.py 20251012   # 导出指定日期（yyyyMMdd）
+#   交互式：python export_all.py  ← 回车后按提示输入日期
+#   非交互：python export_all.py 20251012   ← 仍然支持传参（yyyyMMdd）
 
 import sys
 import subprocess
@@ -23,7 +23,46 @@ LOG_DIR = pathlib.Path(__file__).resolve().parent / "_logs"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-DATE = sys.argv[1] if len(sys.argv) > 1 else datetime.datetime.now().strftime("%Y%m%d")
+# ====== 交互式日期解析 ======
+def _today():
+    return datetime.datetime.now().strftime("%Y%m%d")
+
+def _yesterday():
+    return (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y%m%d")
+
+def resolve_date():
+    """
+    优先使用命令行参数；否则交互式输入。
+    支持：
+      - 直接输入 8 位日期：20251012
+      - 回车：使用今天
+      - t/T/today：今天
+      - y/Y/yesterday：昨天
+      - q/quit：退出
+    """
+    if len(sys.argv) > 1:
+        cand = sys.argv[1].strip()
+        if not re.fullmatch(r"\d{8}", cand):
+            print(f"[ERROR] 非法日期参数: {cand}，应为 yyyyMMdd。")
+            sys.exit(1)
+        return cand
+
+    while True:
+        raw = input("请输入导出日期 (yyyyMMdd)，回车=今天，y=昨天，q=退出：").strip()
+        if raw == "":
+            return _today()
+        if raw.lower() in ("t", "today"):
+            return _today()
+        if raw.lower() in ("y", "yesterday"):
+            return _yesterday()
+        if raw.lower() in ("q", "quit"):
+            print("已取消。")
+            sys.exit(0)
+        if re.fullmatch(r"\d{8}", raw):
+            return raw
+        print("格式不对，请输入 8 位日期（例如 20251012），或直接回车/输入 y。")
+
+DATE = resolve_date()
 print(f"[INFO ] date={DATE}  pattern=*_{DATE}_*")
 
 # ====== ADB 工具 ======
@@ -102,7 +141,6 @@ def autodetect_phone_serial():
     p = adb("devices", capture=True)
     lines = (p.stdout or "").splitlines()
     devs = [ln.split()[0] for ln in lines if "\tdevice" in ln]
-    # 你当前环境基本只有一台手机在连；直接取第一个即可
     return devs[0] if devs else None
 
 def phone_paths(subdir):
@@ -121,26 +159,31 @@ def export_phone_dirs(serial):
     pairs_root = phone_paths("TimeSyncPairs")
     logs_root  = phone_paths("Documents/CollectionLogs")
 
-    # TimeSyncPairs：文件名不含日期（如 00h_Left_xxx.jsonl），直接全量导出当天产生的目录——
-    # 这里直接全量导出该目录（一般数量不大）
+    # —— TimeSyncPairs：现在文件名已含日期，按 *_{DATE}_* 过滤 —— #
     pairs_list = list_remote(serial, pairs_root)
-    need_pairs = len(pairs_list) > 0
+    picked_pairs = [f for f in pairs_list if re.search(rf"_{DATE}_", f)]
+    need_pairs = len(picked_pairs) > 0
 
-    # CollectionLogs：按文件名里的 YYYYMMDD 过滤
+    # —— CollectionLogs：按日期过滤 —— #
     logs_list = list_remote(serial, logs_root)
     picked_logs = [f for f in logs_list if re.search(rf"{DATE}", f)]
     need_logs = len(picked_logs) > 0
 
     if not need_pairs and not need_logs:
-        print(f"[WARN ] No external folders for {DATE} on Phone. 可能今天手机侧未产出文件。")
+        print(f"[WARN ] No phone files for {DATE}. 可能当天手机侧未产出匹配文件。")
         return
 
-    # 分别导出两个小 tar，更直观
     if need_pairs:
         out_pairs = EXPORT_DIR / f"{DATE}_Phone_TimeSyncPairs.tar"
         err_pairs = LOG_DIR / f"Phone_TimeSyncPairs_{DATE}.stderr"
-        print(f"[WORK ] Exporting (PHONE) TimeSyncPairs -> '{out_pairs}' ...")
-        cmd_pairs = f"sh -c 'cd {pairs_root} && tar -cf - . 2>/dev/null || true'"
+        print(f"[WORK ] Exporting (PHONE) TimeSyncPairs (filtered by {DATE}) -> '{out_pairs}' ...")
+        cmd_pairs = (
+            f"sh -c '"
+            f"cd {pairs_root} || exit 2; "
+            f"MATCHES=$(ls -1 *_{DATE}_* 2>/dev/null | head -n1); "
+            f"if [ -z \"$MATCHES\" ]; then echo NO_MATCH >&2; exit 3; fi; "
+            f"tar -cf - *_{DATE}_*'"
+        )
         exec_out_to_files(serial, cmd_pairs, str(out_pairs), str(err_pairs))
         if out_pairs.exists() and out_pairs.stat().st_size > 0:
             print(f"[DONE ] Phone TimeSyncPairs -> {out_pairs} ({out_pairs.stat().st_size} bytes)")
@@ -152,8 +195,13 @@ def export_phone_dirs(serial):
         out_logs = EXPORT_DIR / f"{DATE}_Phone_CollectionLogs.tar"
         err_logs = LOG_DIR / f"Phone_CollectionLogs_{DATE}.stderr"
         print(f"[WORK ] Exporting (PHONE) CollectionLogs (filtered by {DATE}) -> '{out_logs}' ...")
-        files_quoted = " ".join([f"'{x}'" for x in picked_logs])
-        cmd_logs = f"sh -c 'cd {logs_root} && tar -cf - {files_quoted} 2>/dev/null || true'"
+        cmd_logs = (
+            f"sh -c '"
+            f"cd {logs_root} || exit 2; "
+            f"MATCHES=$(ls -1 *{DATE}* 2>/dev/null | head -n1); "
+            f"if [ -z \"$MATCHES\" ]; then echo NO_MATCH >&2; exit 3; "
+            f"fi; tar -cf - *{DATE}*'"
+        )
         exec_out_to_files(serial, cmd_logs, str(out_logs), str(err_logs))
         if out_logs.exists() and out_logs.stat().st_size > 0:
             print(f"[DONE ] Phone CollectionLogs -> {out_logs} ({out_logs.stat().st_size} bytes)")
