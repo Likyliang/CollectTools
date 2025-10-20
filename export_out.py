@@ -13,11 +13,6 @@ import re
 WATCH_PKG = "com.dlut.wearosbleserver"
 PHONE_PKG = "com.dlut.androidbleclient"
 
-WATCHES = [
-    ("Watch_A", "adb-RFAX20LXZVD-xtiC5U._adb-tls-connect._tcp"),
-    ("Watch_B", "adb-RFAX20M1FHH-7IKjNY._adb-tls-connect._tcp"),
-]
-
 EXPORT_DIR = pathlib.Path(r"D:\Data\Watch_Data_original")
 LOG_DIR = pathlib.Path(__file__).resolve().parent / "_logs"
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -86,6 +81,103 @@ def exec_out_to_files(serial, inner_cmd, out_path, err_path):
 def test_online(serial):
     return adb("-s", serial, "get-state").returncode == 0
 
+def _shell(serial, cmd):
+    p = adb("-s", serial, "shell", cmd, capture=True)
+    return (p.stdout or "").strip(), (p.stderr or "").strip(), p.returncode
+
+# ====== 设备自动识别 ======
+def list_attached_serials():
+    p = adb("devices", capture=True)
+    lines = (p.stdout or "").splitlines()
+    devs = []
+    for ln in lines[1:]:
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            devs.append(parts[0])
+    return devs
+
+def has_pkg(serial, pkg):
+    # pm path 优先；部分设备需使用 cmd package path
+    out, err, _ = _shell(serial, f"pm path {pkg} || cmd package path {pkg} 2>/dev/null || true")
+    return bool(out and "package:" in out)
+
+def get_characteristics(serial):
+    out, _, _ = _shell(serial, "getprop ro.build.characteristics")
+    return out.lower()
+
+def get_android_id(serial):
+    # settings get secure android_id 更稳定（与用户/设备绑定），失败则退回 ro.serialno
+    out, _, _ = _shell(serial, "settings get secure android_id 2>/dev/null || true")
+    val = out.strip()
+    if not val or val == "null":
+        out2, _, _ = _shell(serial, "getprop ro.serialno")
+        val = out2.strip() or serial
+    return val
+
+def classify_device(serial):
+    # 先看是否安装了对应包，再看 build 特征
+    is_phone_pkg = has_pkg(serial, PHONE_PKG)
+    is_watch_pkg = has_pkg(serial, WATCH_PKG)
+    ch = get_characteristics(serial)
+
+    is_watch_char = "watch" in ch
+    is_phone_char = "phone" in ch or "default" in ch  # 有些手机给 default/handheld
+
+    if is_phone_pkg or (is_phone_char and not is_watch_pkg):
+        return "phone"
+    if is_watch_pkg or is_watch_char:
+        return "watch"
+    return "unknown"
+
+def autodetect_devices():
+    """返回 {'Phone': <serial或None>, 'Watch_A': <serial或None>, 'Watch_B': <serial或None>}"""
+    serials = list_attached_serials()
+    if not serials:
+        print("[ERROR] 未检测到任何处于 device 状态的设备。请先 adb connect / 打开调试。")
+        return {"Phone": None, "Watch_A": None, "Watch_B": None}
+
+    phones, watches = [], []
+    for s in serials:
+        if not test_online(s):
+            continue
+        role = classify_device(s)
+        if role == "phone":
+            phones.append(s)
+        elif role == "watch":
+            watches.append(s)
+        else:
+            print(f"[WARN ] 未能识别角色: {s}（既非明确 phone 也非 watch）")
+
+    phone_serial = phones[0] if phones else None
+
+    # 对手表按稳定 ID 排序并命名为 A / B
+    watch_with_id = [(s, get_android_id(s)) for s in watches]
+    watch_with_id.sort(key=lambda x: x[1])  # 稳定、可跨电脑保持一致
+    wa = watch_with_id[0][0] if len(watch_with_id) >= 1 else None
+    wb = watch_with_id[1][0] if len(watch_with_id) >= 2 else None
+
+    # 打印识别结果
+    print("[AUTO ] 设备识别结果：")
+    if phone_serial:
+        print(f"        Phone   -> {phone_serial}")
+    else:
+        print("        Phone   -> 未找到（将跳过手机侧导出）")
+
+    if wa:
+        print(f"        Watch_A -> {wa}")
+    else:
+        print("        Watch_A -> 未找到")
+
+    if wb:
+        print(f"        Watch_B -> {wb}")
+    else:
+        print("        Watch_B -> 未找到")
+
+    return {"Phone": phone_serial, "Watch_A": wa, "Watch_B": wb}
+
 # ====== 手表：外部目录导出 ======
 WATCH_EXT_BASES = [
     lambda pkg: f"/sdcard/Android/data/{pkg}/files",
@@ -106,7 +198,7 @@ def choose_watch_ext_base(serial, pkg):
 
 def export_watch_external(name, serial, pkg):
     print(f"[CHECK] {name} ({serial})")
-    if not test_online(serial):
+    if not serial or not test_online(serial):
         print(f"[MISS ] {name} not connected.\n"); return
     print(f"[FOUND] {name} is connected.")
 
@@ -137,12 +229,6 @@ def export_watch_external(name, serial, pkg):
     print(f"[DONE ] {name} -> {outfile} ({outfile.stat().st_size} bytes)\n")
 
 # ====== 手机：导出 TimeSyncPairs + Documents/CollectionLogs ======
-def autodetect_phone_serial():
-    p = adb("devices", capture=True)
-    lines = (p.stdout or "").splitlines()
-    devs = [ln.split()[0] for ln in lines if "\tdevice" in ln]
-    return devs[0] if devs else None
-
 def phone_paths(subdir):
     return f"/sdcard/Android/data/{PHONE_PKG}/files/{subdir}"
 
@@ -211,14 +297,22 @@ def export_phone_dirs(serial):
 
     print("[INFO ] Phone export finished.\n")
 
+# ====== 主流程 ======
 def main():
+    roles = autodetect_devices()
     # 1) 导出两块手表（外部 files 下当天会话目录）
-    for name, serial in WATCHES:
-        export_watch_external(name, serial, WATCH_PKG)
+    if roles.get("Watch_A"):
+        export_watch_external("Watch_A", roles["Watch_A"], WATCH_PKG)
+    else:
+        print("[INFO ] 跳过 Watch_A。")
+
+    if roles.get("Watch_B"):
+        export_watch_external("Watch_B", roles["Watch_B"], WATCH_PKG)
+    else:
+        print("[INFO ] 跳过 Watch_B。")
 
     # 2) 导出手机（TimeSyncPairs + CollectionLogs）
-    phone_serial = autodetect_phone_serial()
-    export_phone_dirs(phone_serial)
+    export_phone_dirs(roles.get("Phone"))
 
     print(f"Exports in: {EXPORT_DIR}")
     print(f"Logs in   : {LOG_DIR}")
