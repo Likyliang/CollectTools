@@ -1,20 +1,8 @@
 # align_all_for_date.py
-# 批量：按日期遍历 SESSIONS_ROOT/<DATE> 下所有会话目录，完成左右手对齐并把结果写回各会话目录。
-# 用法：
-#   交互：python align_all_for_date.py  ← 按提示输入日期
-#   传参：python align_all_for_date.py 20251019
-# 可调：
-#   - SESSIONS_ROOT：会话根目录（你之前 organize 的输出根）
-#   - TOLERANCE_MS：跨手表 merge_asof 容差（默认 10ms）
-# 产物：
-#   - 每个会话目录：aligned_<ID>_<动作>_tol{TOL}ms.csv + aligned_<ID>_<动作>_summary.txt
-#   - 日期目录：aligned_summary_<DATE>.csv 汇总表
-
 import pandas as pd
 import re
 import sys
 from pathlib import Path
-from typing import Tuple, Optional
 import datetime
 import traceback
 
@@ -23,22 +11,41 @@ SESSIONS_ROOT = Path(r"D:\Data\Watch_Data_sessions")  # 组织后的会话根目
 TOLERANCE_MS  = 10  # 跨手表 merge_asof 容差
 # =======================
 
+# 更稳健的日志正则：CID 恰好 3 个字母/数字；用 search 而非 match
 LOG_TXT_PATTERN = re.compile(
-    r"^log_(?P<date>\d{8})_(?P<hm>\d{4})_(?P<id>\d{3})_(?P<action>.+?)_(FINAL|TEMP)\.txt$",
+    r"log_(?P<date>\d{8})_(?P<hm>\d{4})_(?P<id>[0-9A-Za-z]{3})_(?P<action>.+?)_(FINAL|TEMP)\.txt",
     re.IGNORECASE
 )
 CSV_NAME_PATTERN = re.compile(
-    r"^(?P<id>\d{3})_(?P<action>.+?)_(?P<side>Left|Right)_(?P<date>\d{8})_(?P<hms>\d{6})_(?P<type>acc|gyr)\.csv$",
+    r"^(?P<id>[0-9A-Za-z]{3})_(?P<action>.+?)_(?P<side>Left|Right)_(?P<date>\d{8})_(?P<hms>\d{6})_(?P<type>acc|gyr)\.csv$",
     re.IGNORECASE
 )
+
+def _norm_name(s: str) -> str:
+    # 统一全角空格→半角，去掉零宽字符/BOM
+    return (s.replace("\u3000", " ")
+             .replace("\u200b", "")
+             .replace("\ufeff", "")
+             .strip())
+
+def _pick_log(session: Path) -> Path:
+    logs = sorted(session.glob("log_*.txt"))
+    if not logs:
+        raise FileNotFoundError(f"在 {session} 未找到日志 log_*.txt")
+    # 优先 FINAL；若多个，取“时间（HHMM）最大”的那份
+    finals = [p for p in logs if p.name.upper().endswith("_FINAL.TXT")]
+    cands  = finals or logs
+    def _hm(p: Path):
+        m = LOG_TXT_PATTERN.search(_norm_name(p.name))
+        return int(m.group("hm")) if m else -1
+    return max(cands, key=_hm)
 
 def resolve_date(argv) -> str:
     def _today(): return datetime.datetime.now().strftime("%Y%m%d")
     if len(argv) > 1:
         cand = argv[1].strip()
         if not re.fullmatch(r"\d{8}", cand):
-            print(f"[ERROR] 日期格式应为 yyyyMMdd：{cand}")
-            sys.exit(1)
+            print(f"[ERROR] 日期格式应为 yyyyMMdd：{cand}"); sys.exit(1)
         return cand
     raw = input("请输入要处理的日期 (yyyyMMdd)，回车=今天：").strip()
     if raw == "": return _today()
@@ -60,11 +67,17 @@ def find_unique_file(session: Path, patterns) -> Path:
     return candidates[-1]
 
 def autodetect_files(session: Path):
-    log_txt = find_unique_file(session, "log_*.txt")
-    mlog = LOG_TXT_PATTERN.match(log_txt.name)
+    # —— 只保留这一份（稳健挑日志 + 宽松解析）——
+    log_txt = _pick_log(session)
+    name = _norm_name(log_txt.name)
+    mlog = LOG_TXT_PATTERN.search(name)   # 用 search，不用 match
     if not mlog:
-        raise ValueError(f"日志命名不符合规范：{log_txt.name}")
-    cid = mlog.group("id")
+        m2 = re.search(r"log_(\d{8})_(\d{4})_([0-9A-Za-z]{3})_(.+?)_(FINAL|TEMP)\.txt", name, re.IGNORECASE)
+        if not m2:
+            raise ValueError(f"日志命名不符合规范：{log_txt.name!r}")
+        mlog = m2
+
+    cid    = mlog.group("id")
     action = mlog.group("action")
 
     left_acc  = find_unique_file(session, "*_Left_*_acc.csv")
@@ -72,13 +85,13 @@ def autodetect_files(session: Path):
     right_acc = find_unique_file(session, "*_Right_*_acc.csv")
     right_gyr = find_unique_file(session, "*_Right_*_gyr.csv")
 
-    # 一致性提示（不强制）
+    # 轻提示（不强制）
     for p in [left_acc, left_gyr, right_acc, right_gyr]:
         m = CSV_NAME_PATTERN.match(p.name)
         if not m:
             print(f"[WARN] CSV 命名非标准：{p.name}")
             continue
-        if m.group("id") != cid or m.group("action") != action:
+        if (m.group("id") != cid) or (m.group("action") != action):
             print(f"[WARN] {p.name} 的采集号/动作与日志不完全一致（继续处理）")
 
     return log_txt, left_acc, left_gyr, right_acc, right_gyr, cid, action
@@ -137,7 +150,6 @@ def load_and_prepare_hand(acc_path: Path, gyr_path: Path, suffix: str) -> pd.Dat
     return df_hand.sort_values('wall_ms').reset_index(drop=True)
 
 def process_one_session(session_dir: Path, date: str) -> dict:
-    """返回统计信息字典；如失败，抛异常到上层捕获。"""
     log_txt, left_acc, left_gyr, right_acc, right_gyr, cid, action = autodetect_files(session_dir)
     sync = parse_log_file(log_txt)
 
@@ -184,7 +196,9 @@ def process_one_session(session_dir: Path, date: str) -> dict:
     report = (
         f"date: {date}\n"
         f"session_dir: {session_dir.name}\n"
-        f"id: {cid}\naction: {action}\n"
+        f"id: {cid}\n"
+        f"action: {action}\n"
+        f"log_file: {log_txt.name}\n"
         f"tolerance_ms: {TOLERANCE_MS}\n"
         f"user_click_ts: {sync['user_click_ts']}\n"
         f"master_start: {master_start}\nmaster_end: {master_end}\n"
@@ -207,20 +221,15 @@ def main():
     date = resolve_date(sys.argv)
     day_dir = SESSIONS_ROOT / date
     if not day_dir.exists():
-        print(f"[ERROR] 目录不存在：{day_dir}")
-        sys.exit(1)
+        print(f"[ERROR] 目录不存在：{day_dir}"); sys.exit(1)
 
-    # 会话文件夹：名称里含日期即可
     session_dirs = sorted([p for p in day_dir.iterdir() if p.is_dir() and date in p.name])
     if not session_dirs:
-        print(f"[WARN] {day_dir} 下未发现会话目录。")
-        sys.exit(0)
+        print(f"[WARN] {day_dir} 下未发现会话目录。"); sys.exit(0)
 
     print(f"[INFO] 共发现 {len(session_dirs)} 个会话，开始处理……")
 
-    rows = []
-    fail_log = []
-
+    rows, fail_log = [], []
     for i, sess in enumerate(session_dirs, 1):
         print(f"\n[{i}/{len(session_dirs)}] 处理：{sess.name}")
         try:
@@ -230,12 +239,8 @@ def main():
         except Exception as e:
             print(f"    ✗ 失败：{e}")
             fail_log.append({"session": sess.name, "error": str(e)})
-            # 写入会话目录 error.log 便于排查
-            (sess / "align_error.log").write_text(
-                f"{e}\n\n{traceback.format_exc()}", encoding='utf-8'
-            )
+            (sess / "align_error.log").write_text(f"{e}\n\n{traceback.format_exc()}", encoding='utf-8')
 
-    # 汇总
     if rows:
         df_sum = pd.DataFrame(rows)
         sum_csv = day_dir / f"aligned_summary_{date}.csv"
